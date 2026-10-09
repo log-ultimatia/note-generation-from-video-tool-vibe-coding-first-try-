@@ -1,0 +1,41 @@
+# cs61a_notes 运行依赖
+#
+# 安装：pip install -r requirements.txt
+#
+# 版本下限按开发时实测通过的版本给出；不写死上限，避免和别的东西冲突。
+# 实测通过的版本写在每行注释里，出问题时可以照着钉住。
+
+# ---- 主流程 ----
+ImageHash>=4.3.2        # 4.3.2  step4：pHash 感知哈希合并画面相同的帧
+Pillow>=10.0.0          # 12.3.0  读图、缩放、重编码（PDF 配图、转场帧修正）
+rapidocr>=3.9.2         # 3.9.2   step3：逐帧 OCR（同时给出文字块的 x/y 坐标）
+onnxruntime>=1.17.0     # 1.30.0  rapidocr 的默认推理后端
+yt-dlp>=2024.1.0        # 2026.8.19  网址下载视频
+
+# numpy / opencv-python 是 rapidocr 的传递依赖，一般会自动装上。
+numpy>=1.24             # 2.5.3
+
+# ---- 可选：让 OCR 快约 1.9 倍 ----
+# 实测 18 张 1080p 课件帧：onnxruntime 23.1s -> OpenVINO 12.2s，识别结果逐行一致。
+# 装不上也没关系，config.OCR_ENGINE="auto" 会自动退回 onnxruntime。
+openvino>=2024.0.0      # 2026.4.1
+
+# ---- 可选：把视频文件拖进窗口 ----
+# 没装则自动关闭该功能，其它一切照常。
+tkinterdnd2>=0.4.0      # 0.6.3
+
+# ---- 语音转写（二选一，建议装在单独的虚拟环境里）----
+#
+# 推荐 faster-whisper：实测 40 分钟视频 250s -> 44s（55 倍实时），比 openai-whisper
+# 快 4~6 倍。它需要 CUDA 版 torch，建议这样装（不要直接 pip install 到主环境）：
+#
+#   python -m venv D:\cs61a_venv --system-site-packages
+#   D:\cs61a_venv\Scripts\python.exe -m pip install --no-deps --no-cache-dir `
+#     --index-url https://download.pytorch.org/whl/cu126 "torch==2.14.1+cu126"
+#   D:\cs61a_venv\Scripts\python.exe -m pip install faster-whisper
+#
+# 然后在 .env 里写 WHISPER_PYTHON=D:\cs61a_venv\Scripts\python.exe
+#
+# 两个都不装也能跑：会退回系统 PATH 里的 whisper 命令（CPU，很慢）。
+# faster-whisper>=1.0.0
+# openai-whisper>=20231117
