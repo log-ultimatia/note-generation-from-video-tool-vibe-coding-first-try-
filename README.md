@@ -1,7 +1,9 @@
-# cs61a_notes —— 课程视频自动生成笔记
+# 课程视频 → PDF 笔记
 
-给一个课程视频（本地文件或网址），自动产出带 PPT 配图、代码块和注意事项的中文笔记，
-输出 **Markdown** 和 **PDF**。
+给一个课程视频（本地文件或网址）——**中英文都可以**——自动产出带 PPT 配图、代码块和
+注意事项的中文笔记，输出 **Markdown** 和 **PDF**。
+
+不绑定任何特定课程：抽帧、转写、OCR 全部本地完成，最后交给大模型逐页整理成笔记。
 
 ![界面](docs/preview-gui.png)
 
@@ -48,17 +50,17 @@ notepad .env                     # 把 DEEPSEEK_API_KEY 换成你自己的密钥
 **想要转写快很多**，再装一个 GPU 环境（可选，不装会自动退回 CPU 版 whisper，能跑但慢）：
 
 ```powershell
-python -m venv D:\cs61a_venv --system-site-packages
-$env:TMP="D:\cs61a_pip_tmp"; $env:TEMP="D:\cs61a_pip_tmp"
-D:\cs61a_venv\Scripts\python.exe -m pip install --no-deps --no-cache-dir `
+python -m venv D:\whisper-venv --system-site-packages
+$env:TMP="D:\pip-tmp"; $env:TEMP="D:\pip-tmp"
+D:\whisper-venv\Scripts\python.exe -m pip install --no-deps --no-cache-dir `
   --index-url https://download.pytorch.org/whl/cu126 "torch==2.14.1+cu126"
-D:\cs61a_venv\Scripts\python.exe -m pip install --no-cache-dir faster-whisper
+D:\whisper-venv\Scripts\python.exe -m pip install --no-cache-dir faster-whisper
 ```
 
 然后在 `.env` 里加一行告诉程序这个环境在哪：
 
 ```
-WHISPER_PYTHON=D:\cs61a_venv\Scripts\python.exe
+WHISPER_PYTHON=D:\whisper-venv\Scripts\python.exe
 ```
 
 > **ffmpeg 请用带 `libdav1d` 的构建**（BtbN 的 `win64-gpl` 或 gyan.dev 的 full 版）。
@@ -90,9 +92,48 @@ WHISPER_PYTHON=D:\cs61a_venv\Scripts\python.exe
 
 1. 在输入框里填**视频路径**或**视频网址**（B 站等 yt-dlp 支持的站点都行），
    也可以点「选择本地文件…」，或者**直接把视频文件拖进窗口**
-2. 点「**▶ 开始生成**」
-3. 进度实时显示在「③ 运行日志」里（一节 40 分钟的课约 **6~7 分钟**）
-4. 完成后「② 生成的笔记」里会列出 PDF，点「打开 PDF」或双击列表行即可
+2. 选「内容类型」（默认**自动判断**，见下）——一般不用改
+3. 点「**▶ 开始生成**」
+4. 进度实时显示在「③ 运行日志」里（一节 40 分钟的课约 **6~7 分钟**）
+5. 完成后「② 生成的笔记」里会列出 PDF，点「打开 PDF」或双击列表行即可
+
+### 中途暂停、之后再接着跑
+
+长视频要跑一二十分钟，中途电脑不一定能一直开着，所以做了**暂停**和**续跑**。
+
+**点「⏸ 暂停」** —— 不会丢掉任何已完成的成果：
+
+| 步骤 | 暂停的时机 | 代价 |
+|---|---|---|
+| step5 生成笔记 | 当前场景做完就停 | **零损失**（每个场景都已落盘，API 的钱没白花） |
+| step3 OCR | 当前图片做完就停 | 这一轮 OCR 要重做（几分钟，不花钱） |
+| step1/step2 | 是单个长命令，等它跑完 | 已完成的那一步不会重跑 |
+
+**继续跑**：**输入框留空，直接点「开始生成」** —— 程序会找到跑了一半的任务，
+从断点那一步接着做。也可以重新填同一个视频路径/链接。
+
+> 为什么续跑能省时间：每一步的产物都留在磁盘上（`_scene_info.json` / `.srt` /
+> `_ocr.json` / `_scenes.json`），续跑时按进度文件跳过已完成的步骤。
+> step5 更是**逐场景保存**，重新运行时只补没做的场景——不会重复花钱调 API。
+>
+> 进度记在 `output/{视频}_progress.json`，整个流程跑完会自动删除。
+
+### 内容类型
+
+不同视频"值得抽帧的东西"不一样，所以分了三档：
+
+| 类型 | 适合 | 抽帧 | OCR | 笔记风格 |
+|---|---|---|---|---|
+| **课件演示** | 幻灯片、录屏讲课 | 场景检测，密 | **开**（关键） | 课程笔记 |
+| **讲座访谈** | 讲座、访谈、播客 | 稀疏（≥20 秒一张） | 关 | 要点摘要 |
+| **通用视频** | vlog、影视、其他 | 定时每 15 秒 | 关 | 内容摘要 |
+
+**默认「自动判断」**：按实测帧密度区分——幻灯片型视频画面几乎不动
+（实测每 17~52 秒才变一次），连续画面的视频帧帧都在变（通常 8 秒以内一帧）。
+分界线取 8 秒，而且**偏向课件型**：判成通用型会跳过 OCR、丢掉全部画面文字，
+反过来只是多做一轮 OCR。
+
+自动判断分不清"屏幕录制教程"这类边界情况，**这时手动选一下**就行。
 
 ### 界面说明
 
@@ -184,7 +225,7 @@ step5 靠这两个坐标还原出带缩进的代码块。
 
 ### 实测耗时
 
-以一节 **9 分钟**的 CS61A 录屏（1920×1080 AV1，RTX 4070）实测：
+以一节 **9 分钟**的课程录屏（1920×1080 AV1，RTX 4070）实测：
 
 | 步骤 | 耗时 | 说明 |
 |---|---|---|
@@ -348,10 +389,13 @@ square(-2)
 | `WHISPER_ENGINE` | `auto` | 优先 faster-whisper，不可用自动退回 openai-whisper |
 | `WHISPER_MODEL` | `small` | 想更准可改 `large-v3`（更慢） |
 | `WHISPER_DEVICE` | `auto` | 自动探测 CUDA；也可写死 `cuda` / `cpu` |
-| `WHISPER_PYTHON` | `D:\cs61a_venv\...\python.exe` | **CUDA 版 torch 所在的 venv，别删** |
+| `WHISPER_PYTHON` | `D:\whisper-venv\...\python.exe` | **CUDA 版 torch 所在的 venv，别删** |
 | `OCR_ENGINE` | `auto` | 优先 OpenVINO，不可用退回 onnxruntime |
 | `OCR_NUM_THREADS` | `8` | **换机器要重调** |
 | `OCR_MIN_CONFIDENCE` | `0.5` | 低于此置信度的 OCR 结果丢弃 |
+| `VIDEO_PROFILE` | `auto` | 内容类型：`auto`/`slides`/`talk`/`general`（界面也能选） |
+| `MAX_FRAMES_PER_VIDEO` | `200` | 抽帧总数上限，超了就均匀放宽间隔 |
+| `WHISPER_LANGUAGE` | `None` | **自动检测语言**。写死 `"en"` 会让中文视频变乱码 |
 | `SCENE_THRESHOLD` | `0.05` | 画面切换灵敏度，**别改成 0.3** |
 | `SCENE_SETTLE_OFFSET` | `0.5` | 抽帧偏移秒数，避开转场淡变 |
 | `PHASH_THRESHOLD` | `8` | 画面相似度合并阈值，越小越严格 |
@@ -412,14 +456,14 @@ pip install imagehash Pillow rapidocr onnxruntime openvino yt-dlp
 pip install tkinterdnd2
 
 # 语音转写（装在 D 盘 venv 里，避免污染系统环境）
-python -m venv D:\cs61a_venv --system-site-packages
-$env:TMP="D:\cs61a_pip_tmp"; $env:TEMP="D:\cs61a_pip_tmp"
-D:\cs61a_venv\Scripts\python.exe -m pip install --no-deps --no-cache-dir `
+python -m venv D:\whisper-venv --system-site-packages
+$env:TMP="D:\pip-tmp"; $env:TEMP="D:\pip-tmp"
+D:\whisper-venv\Scripts\python.exe -m pip install --no-deps --no-cache-dir `
   --index-url https://download.pytorch.org/whl/cu126 "torch==2.14.1+cu126"
-D:\cs61a_venv\Scripts\python.exe -m pip install --no-cache-dir faster-whisper
+D:\whisper-venv\Scripts\python.exe -m pip install --no-cache-dir faster-whisper
 ```
 
-### 关于 `D:\cs61a_venv`
+### 关于 `D:\whisper-venv`（示例路径，可自定）
 
 这里是一个 `--system-site-packages` 虚拟环境，它继承系统 Python 里已装的 numpy 等包，
 只是把 torch 换成 CUDA 版（`2.14.1+cu126`），不污染系统环境。
@@ -434,7 +478,7 @@ faster-whisper 从 HuggingFace 拉模型，而 **huggingface.co 国内直连不�
 
 ```python
 WHISPER_HF_ENDPOINT = "https://hf-mirror.com"   # 镜像
-WHISPER_MODEL_DIR   = r"D:\cs61a_models"        # 模型缓存目录
+WHISPER_MODEL_DIR   = r"D:\whisper-models"        # 模型缓存目录
 ```
 
 ---
@@ -445,9 +489,10 @@ WHISPER_MODEL_DIR   = r"D:\cs61a_models"        # 模型缓存目录
 |---|---|
 | **生成 PDF 时报 `platform_channel ... 拒绝访问`** | 程序跑在受限环境里（典型是 DSH 沙箱的终端）。Edge 是多进程架构、靠命名管道通信，沙箱禁止命名管道。**在沙箱外的普通终端运行，或直接双击快捷方式**就正常 |
 | **笔记里的 PPT 配图发黑** | 抽帧落在了幻灯片淡入淡出过程中，已由 `SCENE_SETTLE_OFFSET` 处理。若仍有，重跑 step1 |
-| **`Library cublas64_12.dll is not found`** | CTranslate2 找不到 CUDA 库。`step2_transcribe.py` 会自动从 `torch\lib` 加载，若仍报错请确认 `D:\cs61a_venv` 完整 |
+| **`Library cublas64_12.dll is not found`** | CTranslate2 找不到 CUDA 库。`step2_transcribe.py` 会自动从 `torch\lib` 加载，若仍报错请确认 `D:\whisper-venv` 完整 |
 | **下载模型报 `WinError 10054`** | huggingface.co 直连不通，确认 `WHISPER_HF_ENDPOINT` 设为镜像 |
 | **笔记里的图片打不开** | 图片路径是相对 `output/` 的 `../frames/...`。把 md 挪到别处时需保持 `frames/` 的相对位置 |
+| **中文视频的笔记是英文乱码** | `WHISPER_LANGUAGE` 被写死成了 `"en"`。保持默认的 `None`（自动检测）即可；实测中文视频被强制按英文转写会得到完全错误的字幕（"Git 和 GitHub" → "gate and gate hub"） |
 | **拖拽文件没反应** | 先确认装了 `tkinterdnd2`（没装时不会显示拖拽提示）。另外 Windows 禁止低权限程序接收来自管理员程序的拖放——别用管理员身份启动 |
 | **`step1 报 Option not found`** | ffmpeg 版本的 `-vsync`/`-fps_mode` 写法不匹配。脚本已自动探测两种写法；仍报错请检查 `FFMPEG_PATH` |
 | **下载 YouTube 时提示 `No supported JavaScript runtime`** | 只是 WARNING，不影响下载。常规画质不受影响 |
@@ -459,7 +504,7 @@ WHISPER_MODEL_DIR   = r"D:\cs61a_models"        # 模型缓存目录
 ### 目录结构
 
 ```
-cs61a_notes/
+课程笔记工具/
 ├─ app.py                    图形界面（tkinter）
 ├─ run.py                    命令行串行执行 step1~5
 ├─ config.py                 所有常量都在这里
@@ -476,6 +521,9 @@ cs61a_notes/
 │  └─ make_icon.py               生成图标
 ├─ assets/                   图标
 ├─ video/ frames/ output/ logs/
+│  ├─ output/{视频}_profile.json   内容类型的判断结果（step1 写，step3/5 读）
+│  ├─ output/{视频}_progress.json  断点续跑的进度（跑完自动删）
+│  └─ logs/pause.flag              暂停信号（存在 = 请求暂停）
 ```
 
 ### 改代码时留意

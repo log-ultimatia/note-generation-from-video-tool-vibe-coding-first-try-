@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-cs61a_notes 总入口：一条命令跑完整条流水线。
+总入口：一条命令跑完整条流水线（抽帧 → 转写 → OCR → 合并 → 生成笔记）。
 
     把课程视频丢进 video/ 目录，然后在项目根目录执行：
         python run.py
@@ -66,7 +66,7 @@ def build_env() -> dict:
 def preflight() -> bool:
     """跑之前先做基本检查，避免跑了十分钟才因为 ffmpeg 路径写错而失败。"""
     print("=" * 64)
-    print("cs61a_notes 流水线预检")
+    print("课程笔记流水线预检")
     print("=" * 64)
 
     try:
@@ -163,7 +163,7 @@ def report_notes() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="cs61a_notes 流水线总入口")
+    parser = argparse.ArgumentParser(description="课程笔记流水线总入口")
     parser.add_argument("--from", dest="from_step", type=int, default=1,
                         metavar="N", help="从第 N 步开始执行（1~5，默认 1）")
     parser.add_argument("--only", dest="only_step", type=int, default=None,

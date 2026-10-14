@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-cs61a_notes 公共工具：日志、路径引导、ffmpeg 调用、JSON 读写。
+公共工具：日志、路径引导、ffmpeg 调用、JSON 读写。
 
 所有脚本第一行都这么写，用来拿到项目根目录并 import config：
 

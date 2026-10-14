@@ -45,11 +45,11 @@ def _font(size: int, kind: str = "cn"):
 
 
 SLIDES = [
-    ("CS61A: Structure and Interpretation", [
-        ("CS61A Lecture 1", 60, "cn"),
+    ("示例课程：程序设计入门", [
+        ("示例讲座 01", 60, "cn"),
         ("Recursion and Higher-Order Functions", 36, "cn"),
         ("", 20, "cn"),
-        ("Berkeley CS61A  |  Fall 2024", 28, "cn"),
+        ("示例大学  |  第一学期", 28, "cn"),
     ], (240, 248, 255)),
     ("What is Recursion?", [
         ("Recursion: a function that calls itself", 40, "cn"),
@@ -133,7 +133,7 @@ def draw_slide(title: str, lines, bg) -> Image.Image:
             d.text((60, y), text, font=_font(size, kind), fill=(20, 20, 20))
         y += int(size * 1.45)
     # 右下角页码，方便肉眼核对抽帧结果
-    d.text((W - 90, H - 50), "CS61A", font=_font(22, "cn"), fill=(150, 150, 150))
+    d.text((W - 140, H - 50), "示例课程", font=_font(22, "cn"), fill=(150, 150, 150))
     return img
 
 

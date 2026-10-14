@@ -296,11 +296,13 @@ def run_faster_whisper_worker(video: Path, srt_path: Path) -> int:
     started = time.time()
     segments, info = model.transcribe(
         audio,
-        language=config.WHISPER_LANGUAGE,
+        language=config.WHISPER_LANGUAGE,   # None = 自动检测语言（中英文视频都能处理）
         beam_size=1,                       # 贪心解码：笔记场景不需要 beam search，快很多
         vad_filter=True,                   # 滤掉长静音，减少幻听和无效分段
         condition_on_previous_text=False,  # 避免长视频里错误逐段累积传播
     )
+    logger.info("检测到语言：%s（置信度 %.2f）",
+                info.language, info.language_probability)
 
     collected, last = [], time.time()
     for seg in segments:                   # 这是生成器，边转写边产出，可以报进度
@@ -422,11 +424,14 @@ def transcribe_openai_cli(video: Path, srt_path: Path, whisper_cmd: list,
         *whisper_cmd,
         str(video),
         "--model", config.WHISPER_MODEL,          # 从 config 读，不硬编码
-        "--language", config.WHISPER_LANGUAGE,
         "--device", device,
         "--output_format", "srt",
         "--output_dir", str(config.OUTPUT_PATH),
     ]
+    # WHISPER_LANGUAGE 为 None 时【不能传 --language None】——whisper 会直接报错。
+    # 这种情况下省略该参数，让 whisper 自己检测语言。
+    if config.WHISPER_LANGUAGE:
+        cmd += ["--language", str(config.WHISPER_LANGUAGE)]
     logger.info("转写命令: %s", " ".join(cmd))
 
     # 用 Popen 逐行流式读取，而不是 subprocess.run(capture_output=True)：
@@ -544,7 +549,7 @@ def main() -> int:
     logger.info("=" * 60)
     logger.info("开始转写 %d 个视频（model=%s, language=%s, device=%s）",
                 len(videos), config.WHISPER_MODEL,
-                config.WHISPER_LANGUAGE, config.WHISPER_DEVICE)
+                config.WHISPER_LANGUAGE or "自动检测", config.WHISPER_DEVICE)
     started = datetime.now()
     ok = 0
 

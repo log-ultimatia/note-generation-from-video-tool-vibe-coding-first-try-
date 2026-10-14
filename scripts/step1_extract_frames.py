@@ -250,6 +250,126 @@ def pick_hw_decoder(video: Path, logger: logging.Logger):
 
 
 # ---------------------------------------------------------------------------
+# 内容类型判断与抽帧节流
+# ---------------------------------------------------------------------------
+def video_duration(video: Path) -> float:
+    """用 ffprobe 读视频时长（秒），失败返回 0。"""
+    try:
+        proc = subprocess.run(
+            [config.FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return float((proc.stdout or "0").strip() or 0)
+    except (ValueError, OSError):
+        return 0.0
+
+
+def decide_profile(duration: float, frame_count: int, logger: logging.Logger):
+    """
+    判断这个视频属于哪种内容类型，返回 (profile, 理由)。
+
+    判据是"平均多少秒抽到一帧"：幻灯片型视频画面几乎不动，很久才变一次；
+    连续画面的视频帧帧都在变，抽帧密度高得多。实测两类的差距很明显：
+
+        课件（CS61A 四节）        每 17 ~ 52 秒一帧
+        合成演示课件              每 14 秒一帧
+        中文屏幕录制教程          每 12 秒一帧
+        真正的连续画面视频        通常每 8 秒以内一帧
+
+    【误判代价不对称】：课件型被判成通用型会跳过 OCR、丢掉全部幻灯片文字；
+    反过来只是多做一轮 OCR。所以分界线取 8 秒、偏向课件型。
+
+    只在 slides 和 general 之间二选一；talk 留给手动指定——访谈类视频要不要做
+    OCR 取决于内容，靠密度猜不准。要覆盖就在界面下拉框里选，或
+    设环境变量 VIDEO_PROFILE=talk。
+
+    配置里写死了类型就直接用写死的，不猜。
+    """
+    if getattr(config, "VIDEO_PROFILE", "auto") != "auto":
+        return config.VIDEO_PROFILE, f"配置固定为 {config.VIDEO_PROFILE}"
+
+    slides_at = getattr(config, "AUTO_SLIDES_SEC_PER_FRAME", 8.0)
+
+    if duration <= 0 or frame_count <= 0:
+        return "slides", "时长或帧数未知，按保守的课件型处理"
+
+    sec_per_frame = duration / frame_count
+    if sec_per_frame >= slides_at:
+        return "slides", f"平均 {sec_per_frame:.1f} 秒/帧，画面变化稀疏 → 课件型"
+    return "general", f"平均 {sec_per_frame:.1f} 秒/帧，画面持续变化 → 通用视频"
+
+
+def thin_by_gap(files: list, times: list, min_gap: float, logger: logging.Logger):
+    """
+    按最小间隔节流：把靠得太近的帧直接删掉（文件和记录一起）。
+
+    为什么需要：select=gt(scene,TH) 对【连续画面】会疯狂触发。实测一个中文讲解
+    视频 530 帧里有 161 个间隔小于 0.5 秒，最小只有 0.03 秒（等于相邻两帧），
+    这些帧几乎完全相同，纯属浪费后面每一步的时间。
+
+    注意：config 里虽然一直写着 MIN_FRAME_GAP_SEC，但【旧版 step1 从未引用它】，
+    等于没有节流。这里才真正接上。
+    """
+    if min_gap <= 0:
+        return files, times
+    keep_files, keep_times, last = [], [], None
+    for path, t in zip(files, times):
+        if last is None or (t - last) >= min_gap:
+            keep_files.append(path)
+            keep_times.append(t)
+            last = t
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    dropped = len(files) - len(keep_files)
+    if dropped:
+        logger.info("抽帧节流：最小间隔 %.1fs → 丢弃 %d 帧，保留 %d 帧",
+                    min_gap, dropped, len(keep_files))
+    return keep_files, keep_times
+
+
+def extract_interval(video: Path, frames_dir: Path, interval: float,
+                     logger: logging.Logger):
+    """
+    定时抽样：每 interval 秒取一张，返回 (files, times)。
+
+    连着 showinfo 一起用，这样时间戳是 ffmpeg 报的精确值，不靠自己算。
+    一条命令出全部帧，比"逐帧 seek 重抽"快得多。
+    """
+    for old in frames_dir.glob("scene_*.jpg"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    vf = f"fps=1/{interval},showinfo"
+    cmd = [
+        config.FFMPEG_PATH, "-hide_banner", "-nostdin", "-y",
+        "-i", str(video),
+        "-vf", vf,
+        "-q:v", "3",
+        str(frames_dir / "scene_%06d.jpg"),
+    ]
+    logger.info("定时抽样（每 %.0f 秒一张）: %s", interval, " ".join(cmd))
+    ok, output = run_ffmpeg(cmd, logger)
+    if not ok:
+        tail = "\n".join(output.strip().splitlines()[-10:])
+        raise RuntimeError(f"定时抽样失败，末尾输出：\n{tail}")
+
+    times = [float(m) for m in PTS_TIME_RE.findall(output)]
+    files = sorted(frames_dir.glob("scene_*.jpg"))
+    n = min(len(times), len(files))
+    if len(times) != len(files):
+        logger.warning("定时抽样：时间戳(%d) 与 文件(%d) 数量不一致，按较小值配对",
+                       len(times), len(files))
+    return files[:n], times[:n]
+
+
+# ---------------------------------------------------------------------------
 # 单个视频抽帧
 # ---------------------------------------------------------------------------
 def extract_first_frame(video: Path, frames_dir: Path, logger: logging.Logger):
@@ -296,7 +416,12 @@ def extract_one(video: Path, logger: logging.Logger) -> list:
         shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    vf = f"select='gt(scene,{config.SCENE_THRESHOLD})',showinfo"
+    # 扫描阈值：配置里写死了类型就用该类型的阈值；auto 时只能用通用的 SCENE_THRESHOLD
+    # （类型要等扫描完、算出帧密度才能判断，没法提前知道）。
+    scan_threshold = config.SCENE_THRESHOLD
+    if getattr(config, "VIDEO_PROFILE", "auto") != "auto":
+        scan_threshold = config.profile_preset(config.VIDEO_PROFILE)["scene_threshold"]
+    vf = f"select='gt(scene,{scan_threshold})',showinfo"
     hw_decoder, hw_reason = pick_hw_decoder(video, logger)
     if hw_decoder:
         logger.info("硬件解码：%s（%s）", hw_decoder, hw_reason)
@@ -376,19 +501,72 @@ def extract_one(video: Path, logger: logging.Logger) -> list:
         n = min(len(times), len(files))
         times, files = times[:n], files[:n]
 
+    if not files:
+        logger.warning("场景检测没有抽到任何帧，改用定时抽样兜底")
+        files, times = extract_interval(
+            video, frames_dir, getattr(config, "FALLBACK_INTERVAL_SEC", 15), logger)
+
+    # ---- 判断内容类型，并据此决定抽帧策略 ----
+    duration = video_duration(video)
+    profile, reason = decide_profile(duration, len(files), logger)
+    preset = config.profile_preset(profile)
+    logger.info("内容类型：%s（%s）→ %s", profile, preset["label"], reason)
+
+    if preset["frame_strategy"] == "interval":
+        # 通用视频：画面一直在变，场景检测没有意义，直接定时抽样。
+        # 重抽一遍（一条命令出全部帧），比留着上千张几乎相同的截图强得多。
+        interval = preset["interval_sec"] or 15
+        logger.info("按「%s」策略改为每 %.0f 秒一张（原场景检测抽到 %d 帧）",
+                    preset["label"], interval, len(files))
+        files, times = extract_interval(video, frames_dir, interval, logger)
+    else:
+        # 课件/讲座：保留场景检测结果，但按最小间隔节流（这一步以前是缺失的）
+        files, times = thin_by_gap(files, times, preset["min_frame_gap"], logger)
+
+        # 总帧数上限：帧数会随时长线性增长，不封顶的话三小时的视频能抽出 600+ 帧，
+        # 后面 OCR 和大模型调用都跟着涨。超了就【均匀】放宽间隔，保证全片都覆盖到。
+        cap = getattr(config, "MAX_FRAMES_PER_VIDEO", 0)
+        if cap and len(files) > cap and duration > 0:
+            wider = duration / cap
+            logger.info("帧数 %d 超过上限 %d，把最小间隔放宽到 %.1f 秒后重抽",
+                        len(files), cap, wider)
+            files, times = thin_by_gap(files, times, wider, logger)
+
+        # 画面长期不变时场景检测会抽不到几帧，用定时抽样兜底
+        if preset["interval_sec"] and duration > 0:
+            enough = max(4, int(duration / preset["interval_sec"]))
+            if len(files) < enough * 0.3:
+                logger.info("只抽到 %d 帧（不足预期的 %d 帧），补一轮定时抽样",
+                            len(files), enough)
+                files, times = extract_interval(video, frames_dir,
+                                                preset["interval_sec"], logger)
+
+    if not files:
+        logger.warning("%s：最终没有可用帧", video.name)
+        return []
+
     records = [
         {"image": f.name, "time": round(t, 3)}
         for f, t in zip(files, times)
     ]
 
-    # 修正落在转场淡变中间的帧（见 config.SCENE_SETTLE_OFFSET 的说明）
-    fix_transition_frames(video, frames_dir, records, logger)
+    # 修正落在转场淡变中间的帧。只有课件型才需要：
+    # 那是"幻灯片淡入淡出"特有的问题，别的视频没有淡变翻页这回事。
+    offset = preset.get("settle_offset", 0)
+    if offset:
+        fix_transition_frames(video, frames_dir, records, logger, offset)
 
+    config.save_profile(
+        video.stem, profile, reason,
+        preset=preset["label"], strategy=preset["frame_strategy"],
+        duration=round(duration, 1), frames=len(records),
+        sec_per_frame=round(duration / len(records), 1) if records else 0,
+    )
     return records
 
 
 def fix_transition_frames(video: Path, frames_dir: Path, records: list,
-                          logger: logging.Logger) -> int:
+                          logger: logging.Logger, offset: float = None) -> int:
     """
     把每帧从"检测到画面变化的那一刻"改抽到"变化稳定之后"。
 
@@ -406,7 +584,8 @@ def fix_transition_frames(video: Path, frames_dir: Path, records: list,
     "不够黑但仍在淡变中"的帧），也试过跟全片中位数比（中位数会被暗帧自己拉低，
     要反复跑才收敛）。一律偏移没有阈值要调，也就没有调错的空间。
     """
-    offset = getattr(config, "SCENE_SETTLE_OFFSET", 0.5)
+    if offset is None:
+        offset = getattr(config, "SCENE_SETTLE_OFFSET", 0.5)
     if offset <= 0:
         return 0
 

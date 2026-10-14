@@ -269,6 +269,13 @@ def process_video_dir(engine, video_dir: Path, logger: logging.Logger) -> dict:
     empty_count = 0
 
     for i, image in enumerate(images, start=1):
+        # 暂停检查（安全点）：每张图开始前查一次。
+        # OCR 没有增量落盘，中途停下这一轮就白做了——但这一步本来就只有几分钟，
+        # 而且比"让电脑一直开着"划算。至少不会在暂停后继续烧 CPU。
+        if config.pause_requested():
+            logger.info("收到暂停请求，停在 %d/%d 张（本轮结果不保存，下次重做）",
+                        i - 1, len(images))
+            return None
         try:
             texts = ocr_image(engine, image, min_conf, logger)
         except Exception as exc:
@@ -325,6 +332,22 @@ def main() -> int:
                 len(video_dirs), getattr(config, "OCR_MIN_CONFIDENCE", 0.0),
                 getattr(config, "OCR_MAX_SIDE", 0) or "不限制")
 
+    # 通用视频默认不做 OCR：画面上的文字多半是水印、台标、字幕碎片，是噪声不是信息，
+    # 而 OCR 是这一步的主要成本（约 1 秒/帧）。类型判断见 config.PROFILE_PRESETS。
+    todo_dirs, skipped = [], []
+    for video_dir in video_dirs:
+        preset = config.profile_preset(config.load_profile(video_dir.name, logger))
+        (todo_dirs if preset.get("ocr", True) else skipped).append((video_dir, preset))
+    for video_dir, preset in skipped:
+        logger.info("跳过 OCR：%s（内容类型「%s」不做 OCR）", video_dir.name, preset["label"])
+        # 仍然写一个空的 ocr.json：step4 要读它，缺文件会被当成出错
+        (config.OUTPUT_PATH / f"{video_dir.name}_ocr.json").write_text(
+            "{}", encoding="utf-8")
+    if not todo_dirs:
+        logger.info("所有视频都按内容类型跳过 OCR，本步骤无事可做")
+        return 0
+    video_dirs = [d for d, _ in todo_dirs]
+
     engine = build_engine(logger)
 
     started = time.time()
@@ -337,6 +360,10 @@ def main() -> int:
             logger.error("处理 %s 失败：%s", video_dir.name, exc)
             continue
 
+        if result is None:          # 收到暂停请求
+            logger.info("=" * 60)
+            logger.info("已暂停：完成 %d/%d 个视频的 OCR", ok, len(video_dirs))
+            return 2                # 退出码 2 = 暂停（0 成功 / 1 失败）
         if not result:
             continue
 

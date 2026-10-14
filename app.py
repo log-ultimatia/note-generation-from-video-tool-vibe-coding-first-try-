@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-cs61a_notes 图形界面：填入视频网址或本地路径，自动生成 PDF 笔记。
+图形界面：填入视频网址或本地路径，自动生成 PDF 笔记。
 
 启动方式：
     双击  启动笔记工具.vbs     <- 推荐，完全不出现控制台窗口
@@ -52,6 +52,14 @@ except ImportError:
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 MAX_LOG_LINES = 1000
+
+# 内容类型下拉框：显示名 → config.VIDEO_PROFILE 的取值 → 说明
+PROFILE_CHOICES = (
+    ("自动判断", "auto", "按实测帧密度自动判断（推荐）"),
+    ("课件演示", "slides", "幻灯片/录屏课件：抽帧密、做 OCR、学术笔记"),
+    ("讲座访谈", "talk", "讲座/访谈/播客：抽帧疏、不做 OCR、要点摘要"),
+    ("通用视频", "general", "vlog/影视/其他：定时抽样、不做 OCR、内容摘要"),
+)
 
 # 「② 生成的笔记」列表固定显示多少行。固定而不是随数量伸缩，
 # 是为了让下面的日志区高度稳定、不被列表长高挤掉。
@@ -232,7 +240,7 @@ class App:
             if sys.platform == "win32":
                 import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "cs61a.notes.tool"
+                    "video.notes.tool"
                 )
         except Exception:
             pass
@@ -316,6 +324,24 @@ class App:
 
         self.browse_btn = ttk.Button(row, text="选择本地文件…", command=self._browse)
         self.browse_btn.pack(side="left", padx=(8, 0))
+
+        # 内容类型：决定抽帧密度、是否做 OCR、笔记风格（见 config.PROFILE_PRESETS）。
+        # 默认"自动"——由 step1 按实测帧密度判断；手动指定可以覆盖它。
+        type_row = tk.Frame(parent, bg=C_BG)
+        type_row.pack(fill="x", pady=(5, 0))
+        tk.Label(type_row, text="内容类型：", bg=C_BG, fg=C_MUTED,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.profile_var = tk.StringVar(value=PROFILE_CHOICES[0][0])
+        self.profile_box = ttk.Combobox(
+            type_row, textvariable=self.profile_var, state="readonly", width=12,
+            font=("Microsoft YaHei UI", 9),
+            values=[label for label, _, _ in PROFILE_CHOICES])
+        self.profile_box.pack(side="left")
+        self.profile_tip = tk.Label(
+            type_row, text=PROFILE_CHOICES[0][2], bg=C_BG, fg=C_MUTED,
+            font=("Microsoft YaHei UI", 8))
+        self.profile_tip.pack(side="left", padx=(8, 0))
+        self.profile_box.bind("<<ComboboxSelected>>", self._on_profile_change)
 
         # 拖拽提示；只有 tkinterdnd2 可用时才会填上文字（见 _setup_dnd）
         self.dnd_hint = tk.Label(parent, text="", bg=C_BG, fg=C_MUTED,
@@ -476,6 +502,12 @@ class App:
                                     command=self.start)
         self.start_btn.pack(side="left")
 
+        # 暂停：长视频要跑一二十分钟，中途电脑不一定能一直开着。
+        # 点了之后正在跑的步骤会在下一个安全点干净退出，已完成的部分全部保留。
+        self.pause_btn = ttk.Button(bar, text="⏸  暂停", command=self.pause,
+                                    state="disabled")
+        self.pause_btn.pack(side="left", padx=(8, 0))
+
         self.md_btn = ttk.Button(bar, text="仅把 Markdown 转 PDF",
                                  command=self.convert_existing_md)
         self.md_btn.pack(side="left", padx=(8, 0))
@@ -590,6 +622,16 @@ class App:
         self.log_line("准备好了。填入视频网址或本地路径，点「开始生成」。", "dim")
         self.log_line("一节 40 分钟的课大约需要 6~7 分钟，主要花在抽帧、转写和 OCR 上。",
                       "dim")
+        # 有跑了一半的任务就提示一下：输入框空着直接点「开始生成」就能接着跑
+        try:
+            jobs = config.unfinished_jobs()
+        except Exception:
+            jobs = []
+        if jobs:
+            names = "、".join(str(j.get("video", "?"))[:18] for j in jobs[:3])
+            more = f" 等 {len(jobs)} 个" if len(jobs) > 3 else ""
+            self.log_line(f"有未完成的任务：{names}{more}", "ok")
+            self.log_line("  输入框留空直接点「开始生成」即可从断点继续。", "dim")
 
     # ==================================================================
     # 占位提示
@@ -654,21 +696,25 @@ class App:
                 elif kind == "status":
                     self.status_var.set(a)
                 elif kind == "done":
-                    self._on_done(a)
+                    self._on_done(a, b)
                 elif kind == "refresh_outputs":
                     self.refresh_outputs()
         except queue.Empty:
             pass
         self.root.after(120, self._drain_queue)
 
-    def _on_done(self, ok: bool):
+    def _on_done(self, ok: bool, reason: str = ""):
         self.running = False
         for widget, state in ((self.start_btn, "normal"),
                               (self.browse_btn, "normal"),
                               (self.md_btn, "normal")):
             widget.configure(state=state)
+        self.pause_btn.configure(state="disabled", text="⏸  暂停")
         self._set_progress(False)
-        if ok:
+        if reason == "paused":
+            self.refresh_outputs()
+            self.set_status("已暂停 —— 再点「开始生成」会自动接着跑")
+        elif ok:
             self.refresh_outputs()
             self.set_status("完成")
         else:
@@ -795,10 +841,55 @@ class App:
     def start(self):
         source = self._current_source()
         if not source:
-            messagebox.showwarning("还没填", "请先填视频网址或本地路径。")
-            self.entry.focus_set()
-            return
+            # 输入框空着，但可能有跑了一半的任务——直接接着跑，
+            # 免得为了续跑还要重新选一次文件或粘一次链接。
+            source = self._resume_source()
+            if not source:
+                messagebox.showwarning("还没填", "请先填视频网址或本地路径。")
+                self.entry.focus_set()
+                return
+            self.log_line(f"接着上次未完成的任务：{Path(source).name}", "ok")
+        # 开跑前清掉暂停标志：否则上一轮点过暂停、这次一开始就会立刻停
+        config.clear_pause()
+        # 把界面选的内容类型记录下来 —— 子进程通过环境变量收到它（见 _env）
+        profile = self._selected_profile()
+        config.VIDEO_PROFILE = profile
+        self._profile_choice = profile
+        self.log_line(f"内容类型：{self.profile_var.get()}"
+                      + ("" if profile == "auto" else f"（固定为 {profile}）"), "dim")
         self._launch(lambda: self._run_pipeline(source), "启动中…")
+
+    def _selected_profile(self) -> str:
+        label = self.profile_var.get()
+        for text, value, _ in PROFILE_CHOICES:
+            if text == label:
+                return value
+        return "auto"
+
+    def _resume_source(self) -> str:
+        """
+        找一个"跑了一半"的任务，返回可以直接喂给流程的来源。
+
+        优先用 video/ 里已存在的文件——那就不用重新下载（网址）或重新复制（本地文件）。
+        找不到文件才退回进度里记着的原始来源。
+        """
+        jobs = config.unfinished_jobs()
+        if not jobs:
+            return ""
+        job = jobs[-1]                      # 最近改动的那个
+        video = str(job.get("video") or "")
+        if video and config.VIDEO_PATH.exists():
+            for path in config.VIDEO_PATH.iterdir():
+                if path.is_file() and path.stem == video \
+                        and path.suffix.lower() in config.VIDEO_EXTENSIONS:
+                    return str(path)
+        return str(job.get("source") or "")
+
+    def _on_profile_change(self, _event=None):
+        for text, _value, tip in PROFILE_CHOICES:
+            if text == self.profile_var.get():
+                self.profile_tip.configure(text=tip)
+                return
 
     def _begin(self):
         self.running = True
@@ -806,7 +897,28 @@ class App:
         self.browse_btn.configure(state="disabled")
         self.md_btn.configure(state="disabled")
         self.open_pdf_btn.configure(state="disabled")
+        self.pause_btn.configure(state="normal", text="⏸  暂停")
         self._set_progress(True)
+
+    def pause(self):
+        """
+        请求暂停。
+
+        不是"立刻杀掉进程"，而是写一个信号文件，让正在跑的步骤在【安全点】退出：
+        · step5：每个场景开始前检查 —— 已完成的场景都已落盘，一个都不丢
+        · step3：每张图开始前检查 —— OCR 没有增量保存，这一轮要重做（几分钟）
+        · step1/step2：是单个长命令，只能等它跑完（step1 最多一两分钟）
+
+        这样停下时不会丢掉任何需要花钱的成果（step5 的 API 调用是最贵的）。
+        """
+        if not self.running:
+            return
+        config.request_pause()
+        self.pause_btn.configure(state="disabled", text="正在暂停…")
+        self.set_status("正在暂停：等当前这一步跑到安全点…")
+        self.log_line("", "")
+        self.log_line("收到暂停请求。当前场景/图片做完就停，已完成的不会丢。", "err")
+        self.log_line("（step1/step2 是单个长命令，要等它跑完；step5 会立刻在当前场景后停下）")
 
     def _launch(self, work, status: str):
         if self.running:
@@ -830,23 +942,55 @@ class App:
             stem = video.stem
             self.log_line(f"视频：{video.name}", "ok")
 
+            # 续跑：进度文件记着上次跑到第几步。已完成的步骤直接跳过——
+            # step1 要重新解码整片、step2 要重跑转写，在长视频上都是几分钟。
+            progress = config.load_progress(stem)
+            start_step = int(progress.get("next_step") or 1)
+            if start_step > 1:
+                self.log_line(
+                    f"检测到未完成的任务：已完成 step1~{start_step - 1}，"
+                    f"从 step{start_step} 继续（上次停在 {progress.get('updated', '?')}）", "ok")
+
             steps = [
                 (1, "step1_extract_frames.py", [video.name], "抽取关键帧"),
                 (2, "step2_transcribe.py", [video.name, "--skip-existing"], "语音转写"),
-                (3, "step3_ocr.py", [stem], "识别 PPT 文字"),
+                (3, "step3_ocr.py", [stem], "识别画面文字"),
                 (4, "step4_merge_scenes.py", [stem], "合并场景并对齐字幕"),
                 (5, "step5_generate_notes.py", [stem], "生成中文笔记"),
             ]
 
             for number, script, args, desc in steps:
+                if number < start_step:
+                    continue
+
+                # 上一个步骤结束后被暂停了：记下进度，等下次从这一步继续
+                if config.pause_requested():
+                    config.save_progress(stem, number, source)
+                    self._paused_notice(number)
+                    self.queue.put(("done", True, "paused"))
+                    return
+
                 self.set_status(f"正在执行 step{number}：{desc}…")
                 self.log_line("", "")
                 self.log_line(f"=== step{number}  {desc} ===", "step")
-                if not self._run_script(script, args):
+                rc = self._run_script(script, args)
+
+                if rc == 2:
+                    # 步骤内部安全点退出：成果都已保存，下次从这一步继续
+                    config.save_progress(stem, number, source)
+                    self._paused_notice(number)
+                    self.queue.put(("done", True, "paused"))
+                    return
+                if rc != 0:
                     self.log_line(f"step{number} 失败，流程停止。", "err")
+                    config.save_progress(stem, number, source)
                     self.queue.put(("done", False, ""))
                     return
 
+                # 这一步做完了，进度推进到下一步
+                config.save_progress(stem, number + 1, source)
+
+            # 五步都完成，只剩出 PDF
             md_path = config.OUTPUT_PATH / f"{stem}_final_notes.md"
             self.set_status("正在把 Markdown 转成 PDF…")
             self.log_line("", "")
@@ -854,6 +998,8 @@ class App:
             import md_to_pdf
             pdf = md_to_pdf.convert(md_path, log=self.log_line)
             self.pdf_path = pdf
+
+            config.clear_progress(stem)       # 全跑完了，清掉进度
             self.log_line("", "")
             self.log_line(f"全部完成！PDF：{pdf}", "ok")
             self.queue.put(("done", True, ""))
@@ -862,10 +1008,19 @@ class App:
             self.log_line(f"出错：{type(exc).__name__}: {exc}", "err")
             self.queue.put(("done", False, ""))
 
+    def _paused_notice(self, next_step: int):
+        self.log_line("", "")
+        self.log_line("已暂停。已完成的成果都保留着，没有白花时间。", "ok")
+        self.log_line(f"下次点「开始生成」并填同一个视频，会自动从 step{next_step} 继续。")
+        self.set_status("已暂停")
+
     def _env(self):
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        # 界面选的内容类型必须通过环境变量传给子进程：
+        # step1~5 都是独立进程、会重新 import config，改本进程的内存没用。
+        env["VIDEO_PROFILE"] = getattr(self, "_profile_choice", "auto")
         return env
 
     def _run_cmd(self, cmd, collect=False):
@@ -889,9 +1044,11 @@ class App:
                 if collect:
                     lines.append(line)
         proc.wait()
-        return (proc.returncode == 0, lines) if collect else proc.returncode == 0
+        # 返回【退出码】而不是布尔值：step3/step5 用 2 表示"已暂停"，
+        # 界面要能区分"暂停"和"失败"——前者该保留进度，后者该报错。
+        return (proc.returncode, lines) if collect else proc.returncode
 
-    def _run_script(self, script: str, args: list) -> bool:
+    def _run_script(self, script: str, args: list) -> int:
         return self._run_cmd([sys.executable, str(SCRIPTS_DIR / script), *args])
 
     # ------------------------------------------------------------------
@@ -935,7 +1092,7 @@ class App:
             "--no-playlist", "--newline", "--progress",
             "--no-simulate", "--print", "after_move:filepath",
             url], collect=True)
-        if not ok:
+        if ok != 0:
             self.log_line("下载失败。若是需要登录的站点内容，可先手动下载再用本地路径。", "err")
             return None
 

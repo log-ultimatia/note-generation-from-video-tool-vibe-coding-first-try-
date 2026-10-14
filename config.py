@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-cs61a_notes 项目全局配置。
+课程笔记工具 全局配置。
 
 所有脚本都必须从这里读取常量，禁止在脚本里硬编码路径、阈值或 API Key。
 
@@ -146,10 +146,115 @@ DEEPSEEK_CONCURRENCY = 8
 DEEPSEEK_REASONING_EFFORT = "low"
 
 # ---------------------------------------------------------------------------
+# 内容类型（profile）—— 决定抽帧策略、是否做 OCR、笔记风格
+#
+# 这个工具最初是给"课件型视频"写的：画面几乎静止，一变就是翻页。那套假设
+# 用在别的视频上会崩：
+#   · 连续画面（vlog / 访谈 / 影视）每一帧都在变，场景检测会疯狂触发。
+#     实测一个中文讲解视频 530 帧里有 161 个间隔小于 0.5 秒，最小 0.03 秒。
+#   · 画面上的文字多半是水印、台标、字幕碎片，OCR 出来是噪声。
+#   · "学术风格课程笔记"的写法对访谈/影视完全不合适。
+#
+# 所以按内容类型分档。选 "auto" 时由 step1 按实测帧密度自动判断，
+# 判断结果写在 output/{视频}_profile.json，后续步骤读它。
+# ---------------------------------------------------------------------------
+VIDEO_PROFILE = env_or_dotenv("VIDEO_PROFILE", "auto")   # auto | slides | talk | general
+
+PROFILE_PRESETS = {
+    # 课件 / 演示：画面静止、翻页才变。OCR 是关键信息源。
+    "slides": {
+        "label": "课件演示",
+        "frame_strategy": "scene",
+        "scene_threshold": 0.05,
+        "min_frame_gap": 1.0,     # 同一页幻灯片内的抖动不要重复抽
+        "interval_sec": 0,        # 0 = 不用定时兜底
+        "settle_offset": 0.5,     # 避开淡入淡出中间的黑帧（见 SCENE_SETTLE_OFFSET）
+        "ocr": True,
+        "note_style": "course",
+        "global_summary": True,
+    },
+    # 讲座 / 访谈 / 播客：以语音为主，画面信息少。
+    "talk": {
+        "label": "讲座访谈",
+        "frame_strategy": "scene",
+        "scene_threshold": 0.08,
+        "min_frame_gap": 20.0,    # 抽帧只做"配图"，不用那么密
+        "interval_sec": 120,      # 画面长期不变时兜底
+        "settle_offset": 0.0,     # 不是幻灯片，没有淡变问题
+        "ocr": False,             # 画面文字多半是台标/字幕，是噪声
+        "note_style": "summary",
+        "global_summary": True,
+    },
+    # 通用视频：vlog / 教程 / 影视 / 其他。内容靠语音和画面，定时抽样最稳。
+    "general": {
+        "label": "通用视频",
+        "frame_strategy": "interval",
+        "scene_threshold": 0.10,
+        "min_frame_gap": 15.0,
+        "interval_sec": 15,       # 每 15 秒一张
+        "settle_offset": 0.0,
+        "ocr": False,
+        "note_style": "summary",
+        "global_summary": True,
+    },
+}
+
+# 抽帧节流：两帧之间至少间隔多少秒。
+# 【旧版这组参数写在配置里却从未被 step1 引用】（是早期 extract_frames.py 的遗留），
+# 导致抽帧实际上没有任何节流。现在真正接上了，默认值按 profile 走。
+MIN_FRAME_GAP_SEC = 1.0
+
+# 抽帧总数上限。
+#
+# "最小间隔"是固定值，所以帧数会随时长线性增长：110 分钟的视频实测抽出 356 帧，
+# 后面 OCR（约 0.8 秒/帧）和大模型调用都跟着涨。三小时的视频会更夸张。
+# 这里给个上限，超出就按比例放宽间隔——是【均匀放宽】而不是砍掉后半段，
+# 保证整个视频都覆盖到。
+MAX_FRAMES_PER_VIDEO = 200
+
+# auto 判断的阈值：平均多少秒抽到一帧。
+#
+# 【误判代价是不对称的】：把课件型判成通用型会跳过 OCR，等于丢掉全部幻灯片文字；
+# 反过来把通用型判成课件型，只是多做一轮 OCR、笔记风格偏学术一点。所以阈值要
+# 偏向"课件型"，宁可多做 OCR 也别漏。
+#
+# 实测（9 分钟~110 分钟的视频，秒/帧）：
+#     课件（CS61A 三节）        17.2 / 31.8 / 32.9 / 51.8
+#     合成演示课件              14.0
+#     中文屏幕录制教程          12.4
+#     真正的连续画面视频        通常 < 8
+# 所以分界线取 8 秒：>= 8 一律按课件型处理。实测曾经把 20 秒当分界线，
+# 结果把 17.2 秒/帧的 lecture 判成了通用型、跳过了 OCR——这是必须避免的方向。
+#
+# 自动判断只在 "slides" 和 "general" 之间二选一；"talk" 留给手动指定
+# （访谈类视频是否做 OCR 取决于内容，启发式判不准）。
+AUTO_SLIDES_SEC_PER_FRAME = 8.0     # 平均间隔 >= 此值 → 课件型
+AUTO_GENERAL_SEC_PER_FRAME = 8.0    # 低于此值 → 通用视频
+
+# ---------------------------------------------------------------------------
 # step5：生成笔记时的 OCR 文字加工
 # ---------------------------------------------------------------------------
+# 提示词里的角色设定与术语对照，做成配置项方便针对不同课程调整。
+#
+# 早先这里写死了"你是一位 CS61A 课程的助教"和一组 CS61A 术语对照
+# （recursion=递归, base case=基本情况, ...），结果处理非 CS61A 的视频时
+# 模型会【硬往上面套】：一个中文 Git 教程的笔记里冒出
+#   "无法提炼递归、基本情况、高阶函数、环境图或尾调用等 CS61A 相关概念"
+# 这种整段废话——因为那页本来就没有这些概念，模型只好解释自己为什么找不到。
+# 现在角色改成通用的"课程笔记整理助手"，术语对照默认留空、按需自填。
+STEP5_ROLE = "你是一位课程笔记整理助手"
+
+# 术语对照表。留空 = 不做特殊要求（推荐，让模型按内容自行判断）。
+# 只有当某门课的术语翻译需要统一时才填，例如：
+#     STEP5_TERM_MAP = "recursion=递归, base case=基本情况, higher-order function=高阶函数"
+STEP5_TERM_MAP = ""
+
+# 生成全局摘要（总览 + 章节大纲）时最多送多少条分段概要。
+# 长视频会有几百段，全塞进去既超 token 也影响归纳质量，超过就均匀抽样。
+STEP5_SUMMARY_MAX_SEGMENTS = 200
+
 # 跨场景重复出现的短文本视为页眉/页脚/水印并剔除。
-# 实测课件每页右下角都有 "CS61A" 页脚，OCR 逐页识别出来，不剔除的话
+# 实测课件常在每页固定位置放课程名/水印，OCR 会逐页识别出来，不剔除的话
 # 每段笔记都会混进这一行噪声。
 STEP5_DROP_REPEATED_LINES = True
 STEP5_REPEAT_SCENE_RATIO = 0.6   # 在 >=60% 的场景里都出现就判定为页眉页脚
@@ -187,7 +292,13 @@ WHISPER_PYTHON = _first_existing(
 )
 
 WHISPER_MODEL = "small"
-WHISPER_LANGUAGE = "en"     # CS61A 是英文课；想自动检测改成 None
+# 转写语言。【默认 None = 自动检测】，中英文视频都能处理。
+#
+# 千万别写死 "en"：中文视频被强制按英文转写会得到【完全错误的字幕】。实测一个
+# 中文 Git 教程被转成 "Today we will talk about gate and gate hub"（实际是
+# "今天我们来系统的讲一遍 Git 和 GitHub"），而自动检测正确识别为 zh（置信度 1.00），
+# 而且更快（2.0s vs 2.9s）。只有确定素材全是英文、且想省掉探测开销时才写死 "en"。
+WHISPER_LANGUAGE = None
 WHISPER_DEVICE = "auto"     # auto = 探测到 CUDA 就用 cuda，否则 cpu；也可写死 cuda / cpu
 
 # ---------------------------------------------------------------------------
@@ -387,6 +498,144 @@ def ensure_dirs() -> None:
     """确保所有输出目录存在，脚本启动时调用一次即可。"""
     for path in (VIDEO_PATH, FRAMES_PATH, OUTPUT_PATH, LOGS_PATH):
         path.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 内容类型（profile）的读写
+# ---------------------------------------------------------------------------
+def profile_preset(name: str) -> dict:
+    """取某个内容类型的预设参数；名字不认识就退回课件型（最保守）。"""
+    return PROFILE_PRESETS.get(name, PROFILE_PRESETS["slides"])
+
+
+def profile_file(video: str) -> Path:
+    return OUTPUT_PATH / f"{video}_profile.json"
+
+
+def save_profile(video: str, profile: str, reason: str, **stats) -> None:
+    """
+    记下这个视频被判成什么类型、为什么。必须落盘：
+    step1 判断、step3 和 step5 都要用，它们各自是独立进程。
+    """
+    import json
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    payload = {"profile": profile, "reason": reason, "config": VIDEO_PROFILE}
+    payload.update(stats)
+    profile_file(video).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_profile(video: str, logger=None) -> str:
+    """
+    这个视频该按哪种类型处理。
+
+    配置里写死了就用写死的；写的是 "auto" 则读 step1 的判断结果。
+    读不到（比如只跑 step5、或 step1 还没跑过）就按课件型处理。
+    """
+    import json
+    if VIDEO_PROFILE != "auto":
+        return VIDEO_PROFILE
+    path = profile_file(video)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8")).get("profile") or "slides"
+        except Exception as exc:
+            if logger:
+                logger.warning("读取 %s 失败（%s），按课件型处理", path.name, exc)
+    return "slides"
+
+
+# ---------------------------------------------------------------------------
+# 暂停 / 续跑
+#
+# 一节长视频要跑一二十分钟，中途电脑不一定能一直开着，所以支持"暂停"和"接着跑"。
+#
+# 为什么用【文件】当暂停信号而不是进程内的标志位：step1~5 都是独立子进程，
+# GUI 里设个内存标志它们看不到。文件放在 logs/ 下，谁都能查。
+#
+# 暂停只发生在"安全点"——每个场景/每张图处理完之后。已经做完的成果都会保留，
+# 重新运行时自动跳过（step5 本来就按 tag 跳过，step2 按 srt 跳过）。
+# ---------------------------------------------------------------------------
+PAUSE_FLAG_NAME = "pause.flag"
+
+
+def pause_flag_path() -> Path:
+    return LOGS_PATH / PAUSE_FLAG_NAME
+
+
+def request_pause() -> None:
+    """请求暂停：正在跑的步骤会在下一个安全点干净退出。"""
+    LOGS_PATH.mkdir(parents=True, exist_ok=True)
+    pause_flag_path().write_text("pause", encoding="utf-8")
+
+
+def clear_pause() -> None:
+    """清除暂停请求（开始/继续跑之前调用）。"""
+    try:
+        pause_flag_path().unlink()
+    except OSError:
+        pass
+
+
+def pause_requested() -> bool:
+    """有没有人在请求暂停。各步骤在安全点轮询这个。"""
+    return pause_flag_path().exists()
+
+
+def progress_file(video: str) -> Path:
+    return OUTPUT_PATH / f"{video}_progress.json"
+
+
+def save_progress(video: str, next_step: int, source: str = "", **extra) -> None:
+    """记下"这个视频下次该从第几步开始跑"。next_step 取 1~6，6 表示只剩出 PDF。"""
+    import datetime
+    import json
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "video": video,
+        "next_step": int(next_step),
+        "source": source,
+        "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    payload.update(extra)
+    progress_file(video).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_progress(video: str) -> dict:
+    """读进度；没有或读坏了就返回空 dict（当成从头开始，不影响正常使用）。"""
+    import json
+    path = progress_file(video)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def clear_progress(video: str) -> None:
+    """整个流程跑完后清掉进度，下次就是全新任务。"""
+    try:
+        progress_file(video).unlink()
+    except OSError:
+        pass
+
+
+def unfinished_jobs() -> list:
+    """列出所有"跑了一半"的视频，供界面显示"继续未完成的"。"""
+    jobs = []
+    if not OUTPUT_PATH.exists():
+        return jobs
+    for path in sorted(OUTPUT_PATH.glob("*_progress.json")):
+        video = path.name[: -len("_progress.json")]
+        data = load_progress(video)
+        step = int(data.get("next_step") or 0)
+        if 1 <= step <= 6:
+            data["video"] = video
+            jobs.append(data)
+    return jobs
 
 
 def check_api_key() -> str:
