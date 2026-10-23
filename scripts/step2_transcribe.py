@@ -22,6 +22,7 @@
 """
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -255,6 +256,89 @@ def write_srt(segments: list, path: Path) -> int:
     return index
 
 
+# ---------------------------------------------------------------------------
+# 断点续跑：转写中途中断时不丢已有进度
+# ---------------------------------------------------------------------------
+# 为什么需要：
+#   faster-whisper 的 segments 是生成器，原来的写法只在【全部转完】之后才调
+#   write_srt。所以中途关掉界面 / 进程被结束，这一段就一个字都没留下，
+#   下次只能从头再来。40 分钟的视频要转十几分钟，白跑一次代价很大。
+#
+# 做法（与 youtube2md 项目一致）：
+#   · 每产生几条字幕就把【已转部分】写进 output/{名}.segments.json（原子写）
+#   · 下次启动读到进度就从那里接着转；往前多退一点避开切词，
+#     重叠段按时间戳丢弃，避免同一句话出现两次
+CKPT_SAVE_EVERY = 3      # 攒够这么多条字幕就存一次
+CKPT_SAVE_SEC = 2.0      # 或者距上次存档超过这么多秒也存（双阈值）
+RESUME_OVERLAP = 2.0     # 续跑时往回多转几秒，避免正好切在词中间
+
+
+def _ckpt_path(srt_path: Path) -> Path:
+    return srt_path.with_suffix(".segments.json")
+
+
+def _ckpt_signature(video: Path) -> str:
+    """视频文件或模型变了，旧的半成品就不能再复用。"""
+    st = video.stat()
+    return (f"{config.WHISPER_MODEL}|{config.WHISPER_LANGUAGE or 'auto'}"
+            f"|{st.st_size}|{int(st.st_mtime)}")
+
+
+def _load_partial(srt_path: Path, sig: str, logger: logging.Logger) -> list:
+    """读上次转了一半的字幕。指纹不符就丢弃。"""
+    p = _ckpt_path(srt_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("半成品文件读不了（%s），从头转写", type(exc).__name__)
+        return []
+    if data.get("signature") != sig:
+        logger.info("半成品与当前视频/模型不匹配，丢弃后从头转写")
+        return []
+    segs = data.get("segments") or []
+    segs.sort(key=lambda d: d["start"])
+    return segs
+
+
+def _save_partial(srt_path: Path, sig: str, segments: list) -> None:
+    """
+    原子写：先写 .tmp 再 os.replace 替换。
+    直接写目标文件的话，进程被强杀会留下半截 JSON，下次读就崩。
+    """
+    p = _ckpt_path(srt_path)
+    tmp = p.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps({"signature": sig, "segments": segments},
+                                  ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass      # 存档失败不影响转写本身
+
+
+class Paused(Exception):
+    """
+    收到暂停请求（config.pause_requested()）。
+
+    为什么用异常而不是返回 None：
+      transcribe_one / transcribe_faster_whisper 都返回 Path，
+      中途变成 None 会让调用方到处要判断。抛一个专用异常最省事，
+      而且 main 里能精确区分"暂停"和"失败"——前者该保留进度继续，
+      后者该报错。与 step3/step5 的"退出码 2 = 暂停"约定保持一致。
+    """
+
+
+class _Seg:
+    """把 JSON 里恢复出来的字典包成 write_srt 需要的对象形状。"""
+    __slots__ = ("start", "end", "text")
+
+    def __init__(self, start: float, end: float, text: str):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
 def run_faster_whisper_worker(video: Path, srt_path: Path) -> int:
     """
     faster-whisper 的实际执行体。
@@ -293,6 +377,20 @@ def run_faster_whisper_worker(video: Path, srt_path: Path) -> int:
     logger.info("音频解码完成：%.1f 分钟，耗时 %.1f 秒",
                 len(audio) / 16000 / 60, time.time() - started)
 
+    # ---- 断点续跑：看上次转到哪了 ----
+    sig = _ckpt_signature(video)
+    partial = _load_partial(srt_path, sig, logger)
+    resume_at = float(partial[-1]["end"]) if partial else 0.0
+    total_sec = len(audio) / 16000
+    if resume_at > 0:
+        logger.info("检测到未完成的转写：已有 %d 条字幕，从 %s 处继续（共 %s）",
+                    len(partial), _fmt_srt_time(resume_at),
+                    _fmt_srt_time(total_sec))
+    # 往回退一点再转，避免正好切在一个词中间；重叠部分后面按时间戳丢掉
+    start_sec = max(0.0, resume_at - RESUME_OVERLAP) if resume_at > 0 else 0.0
+    if start_sec > 0:
+        audio = audio[int(start_sec * 16000):]
+
     started = time.time()
     segments, info = model.transcribe(
         audio,
@@ -305,17 +403,56 @@ def run_faster_whisper_worker(video: Path, srt_path: Path) -> int:
                 info.language, info.language_probability)
 
     collected, last = [], time.time()
+    last_save, pending = time.time(), 0
     for seg in segments:                   # 这是生成器，边转写边产出，可以报进度
-        collected.append(seg)
+        item = {
+            "start": round((seg.start or 0.0) + start_sec, 3),
+            "end": round((seg.end or 0.0) + start_sec, 3),
+            "text": (seg.text or "").strip(),
+        }
+        # 续跑时开头会和已存部分重叠，按时间戳丢掉重复的
+        if resume_at > 0 and item["start"] < resume_at - 0.05:
+            continue
+        collected.append(item)
+        pending += 1
+
         now = time.time()
+        # 双阈值落盘：条数够了就存，或者距上次存档超过 2 秒也存。
+        # 只用条数阈值不够 —— small 模型一段 30 秒音频要算 4 秒左右，
+        # 攒够 10 条要 40 秒，用户在前 40 秒内中断仍然什么都存不下。
+        if pending and (pending >= CKPT_SAVE_EVERY
+                        or (now - last_save) >= CKPT_SAVE_SEC):
+            _save_partial(srt_path, sig, partial + collected)
+            pending, last_save = 0, now
+
         if now - last >= 20:
             logger.info("…已转写到 %s（%.1f 分钟处），累计 %.1f 秒",
-                        _fmt_srt_time(seg.end), seg.end / 60, now - started)
+                        _fmt_srt_time(item["end"]), item["end"] / 60, now - started)
             last = now
 
+        # 暂停检查（安全点）：本条字幕已经收下并计入进度，再判断要不要停。
+        # 放在条末而不是条首 —— 放条首会把刚转出来的这一条丢掉，
+        # 万一第一条就暂停，半成品里是 0 条，等于什么都没存。
+        if config.pause_requested():
+            _save_partial(srt_path, sig, partial + collected)
+            logger.info("收到暂停请求：停在 %s 处，已保存 %d 条字幕"
+                        "（下次点「开始生成」会从这里接着转）",
+                        _fmt_srt_time(item["end"]), len(partial) + len(collected))
+            return 2                       # 2 = 暂停（0 成功 / 1 失败）
+
+    # 合并"上次已存"+"本次新转"，按开始时间排序后写 SRT
+    merged = partial + collected
+    merged.sort(key=lambda d: d["start"])
     elapsed = time.time() - started
-    count = write_srt(collected, srt_path)
-    duration = len(audio) / 16000
+    count = write_srt([_Seg(d["start"], d["end"], d["text"]) for d in merged],
+                      srt_path)
+    # 成功产出 SRT 后半成品就没用了，删掉免得留垃圾
+    if count:
+        try:
+            _ckpt_path(srt_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    duration = total_sec
     if elapsed > 0:
         logger.info("转写完成：媒体 %.1f 秒，耗时 %.1f 秒，实时倍率 %.2fx（%d 条字幕）",
                     duration, elapsed, duration / elapsed, count)
@@ -359,6 +496,9 @@ def transcribe_faster_whisper(video: Path, srt_path: Path,
     proc.wait()
     elapsed = time.time() - started
 
+    if proc.returncode == 2:
+        # worker 在安全点主动退出：半成品已落盘，不是失败
+        raise Paused()
     if proc.returncode != 0 or not srt_path.exists():
         raise RuntimeError(f"faster-whisper 退出码 {proc.returncode}，耗时 {elapsed:.1f}s")
 
@@ -565,6 +705,12 @@ def main() -> int:
 
         try:
             srt = transcribe_one(video, whisper_cmd, logger)
+        except Paused:
+            # 当前这个视频的转写进度已落盘，下次会从这里接着转
+            logger.info("=" * 60)
+            logger.info("已暂停：完成 %d/%d 个视频。当前视频的转写进度已保存，"
+                        "下次点「开始生成」会接着继续。", ok, len(videos))
+            return 2                       # 2 = 暂停（0 成功 / 1 失败）
         except Exception as exc:
             logger.error("失败：%s -> %s", video.name, exc)
             continue
